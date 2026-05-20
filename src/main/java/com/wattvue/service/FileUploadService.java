@@ -23,11 +23,19 @@ import java.util.Map;
 /**
  * FILE UPLOAD SERVICE
  *
- * Supports two data formats:
- *   SYSTEM   — Solar production data
- *              Columns: Month/Date | Estimated kWh | Actual kWh
- *   UTILITY  — 15-min utility-meter readings
- *              Columns: Timestamp | kWh (negative = export)
+ * Supports these data formats:
+ *   SYSTEM          — Solar production data (3 columns)
+ *                     Columns: Month/Date | Estimated kWh | Actual kWh
+ *   SOLAR_ACTUAL    — Actual solar production (2 columns)
+ *                     Columns: Date | Actual kWh
+ *   SOLAR_ESTIMATED — Estimated solar production (2 columns)
+ *                     Columns: Date | Estimated kWh
+ *   UTILITY         — 15-min utility-meter readings
+ *                     Columns: Timestamp | kWh (negative = export)
+ *   CLEANING_BEFORE — Solar data before cleaning (2 columns)
+ *                     Columns: Date | Actual kWh
+ *   CLEANING_AFTER  — Solar data after cleaning (2 columns)
+ *                     Columns: Date | Actual kWh
  */
 @Service
 @RequiredArgsConstructor
@@ -73,23 +81,25 @@ public class FileUploadService {
 
         try {
             int rowCount;
-         if ("UTILITY".equalsIgnoreCase(dataType)) {
-    List<UtilityData> rows = parseUtilityFile(file, customer, upload);
-    utilityDataRepository.saveAll(rows);
-    rowCount = rows.size();
-} else if ("SOLAR_ACTUAL".equalsIgnoreCase(dataType) || "SOLAR_ESTIMATED".equalsIgnoreCase(dataType)) {
-    List<SolarData> rows = parseTwoColumnSolarFile(file, customer, upload, dataType);
-    solarDataRepository.saveAll(rows);
-    rowCount = rows.size();
-} else if ("CLEANING_BEFORE".equalsIgnoreCase(dataType) || "CLEANING_AFTER".equalsIgnoreCase(dataType)) {
-    List<SolarData> rows = parseTwoColumnSolarFile(file, customer, upload, dataType);
-    solarDataRepository.saveAll(rows);
-    rowCount = rows.size();
-} else {
-    List<SolarData> rows = parseSolarFile(file, customer, upload);
-    solarDataRepository.saveAll(rows);
-    rowCount = rows.size();
-}
+
+            if ("UTILITY".equalsIgnoreCase(dataType)) {
+                List<UtilityData> rows = parseUtilityFile(file, customer, upload);
+                utilityDataRepository.saveAll(rows);
+                rowCount = rows.size();
+            } else if ("SOLAR_ACTUAL".equalsIgnoreCase(dataType)
+                    || "SOLAR_ESTIMATED".equalsIgnoreCase(dataType)
+                    || "CLEANING_BEFORE".equalsIgnoreCase(dataType)
+                    || "CLEANING_AFTER".equalsIgnoreCase(dataType)) {
+                List<SolarData> rows = parseTwoColumnSolarFile(file, customer, upload, dataType);
+                solarDataRepository.saveAll(rows);
+                rowCount = rows.size();
+            } else {
+                // Default: SYSTEM — 3-column format
+                List<SolarData> rows = parseSolarFile(file, customer, upload);
+                solarDataRepository.saveAll(rows);
+                rowCount = rows.size();
+            }
+
             upload.setStatus("SUCCESS");
             upload.setRowsProcessed(rowCount);
             uploadRepository.save(upload);
@@ -111,7 +121,7 @@ public class FileUploadService {
         }
     }
 
-    // ─── Solar Data Parsing ─────────────────────────────────────────────────────
+    // ─── Solar Data Parsing (3-column: Date | Estimated | Actual) ───────────────
 
     private List<SolarData> parseSolarFile(MultipartFile file, Customer customer, Upload upload) throws Exception {
         String name = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
@@ -157,6 +167,57 @@ public class FileUploadService {
         if (dataList.isEmpty()) {
             throw new RuntimeException(
                     "No valid solar data rows found. Expected columns: Month/Date | Estimated kWh | Actual kWh (with header row).");
+        }
+
+        return dataList;
+    }
+
+    // ─── Two-Column Solar Parsing (Date | kWh) ───────────────────────────────────
+    // Used for: SOLAR_ACTUAL, SOLAR_ESTIMATED, CLEANING_BEFORE, CLEANING_AFTER
+
+    private List<SolarData> parseTwoColumnSolarFile(MultipartFile file, Customer customer, Upload upload, String dataType) throws Exception {
+        String name = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
+        List<String[]> rows = name.endsWith(".csv") ? readCsvRows(file) : readExcelRows(file);
+        List<SolarData> dataList = new ArrayList<>();
+
+        boolean isEstimated = "SOLAR_ESTIMATED".equalsIgnoreCase(dataType);
+
+        for (int i = 1; i < rows.size(); i++) {  // skip header
+            String[] cols = rows.get(i);
+            if (cols.length < 2) continue;
+
+            try {
+                String dateRaw = cols[0].trim();
+
+                // Skip empty, total, or summary rows
+                if (dateRaw.isEmpty()
+                        || dateRaw.equalsIgnoreCase("total")
+                        || dateRaw.equalsIgnoreCase("summary")) continue;
+
+                Double value = parseDouble(cols[1]);
+                if (value == null) continue;
+
+                LocalDate dataDate = tryParseDate(dateRaw);
+
+                dataList.add(SolarData.builder()
+                        .customer(customer)
+                        .upload(upload)
+                        .month(dateRaw)
+                        .dataDate(dataDate)
+                        .actualKwh(isEstimated ? 0.0 : value)
+                        .estimatedKwh(isEstimated ? value : 0.0)
+                        .varianceKwh(0.0)
+                        .variancePct(0.0)
+                        .build());
+
+            } catch (Exception e) {
+                log.warn("Skipping row {}: {}", i, e.getMessage());
+            }
+        }
+
+        if (dataList.isEmpty()) {
+            throw new RuntimeException(
+                    "No valid data rows found. Expected columns: Date | kWh (with header row).");
         }
 
         return dataList;
@@ -288,7 +349,6 @@ public class FileUploadService {
         for (DateTimeFormatter fmt : DATE_FORMATS) {
             try { return LocalDate.parse(s, fmt); } catch (Exception ignored) {}
         }
-        // try datetime first then strip
         LocalDateTime dt = tryParseDateTime(s);
         return dt != null ? dt.toLocalDate() : null;
     }
@@ -306,40 +366,4 @@ public class FileUploadService {
     private double round2(double v) {
         return Math.round(v * 100.0) / 100.0;
     }
-
-    private List<SolarData> parseTwoColumnSolarFile(MultipartFile file, Customer customer, Upload upload, String dataType) throws Exception {
-    String name = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
-    List<String[]> rows = name.endsWith(".csv") ? readCsvRows(file) : readExcelRows(file);
-    List<SolarData> dataList = new ArrayList<>();
-    boolean isEstimated = "SOLAR_ESTIMATED".equalsIgnoreCase(dataType);
-
-    for (int i = 1; i < rows.size(); i++) {
-        String[] cols = rows.get(i);
-        if (cols.length < 2) continue;
-        try {
-            String dateRaw = cols[0].trim();
-            if (dateRaw.isEmpty() || dateRaw.equalsIgnoreCase("total") || dateRaw.equalsIgnoreCase("summary")) continue;
-            Double value = parseDouble(cols[1]);
-            if (value == null) continue;
-            LocalDate dataDate = tryParseDate(dateRaw);
-            dataList.add(SolarData.builder()
-                    .customer(customer)
-                    .upload(upload)
-                    .month(dateRaw)
-                    .dataDate(dataDate)
-                    .actualKwh(isEstimated ? 0.0 : value)
-                    .estimatedKwh(isEstimated ? value : 0.0)
-                    .varianceKwh(0.0)
-                    .variancePct(0.0)
-                    .build());
-        } catch (Exception e) {
-            log.warn("Skipping row {}: {}", i, e.getMessage());
-        }
-    }
-
-    if (dataList.isEmpty()) {
-        throw new RuntimeException("No valid data rows found. Expected columns: Date | kWh (with header row).");
-    }
-    return dataList;
-}
 }
