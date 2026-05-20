@@ -21,16 +21,19 @@ public class UploadController {
     private final UploadRepository uploadRepository;
 
     /**
-     * Upload solar production data (system data).
-     * Columns: Month/Date | Estimated kWh | Actual kWh
+     * Upload any solar/cleaning data.
+     * dataType values: SOLAR_ACTUAL, SOLAR_ESTIMATED, CLEANING_BEFORE, CLEANING_AFTER, SYSTEM
+     * Columns for SOLAR_ACTUAL / SOLAR_ESTIMATED / CLEANING_*: Date | kWh
+     * Columns for SYSTEM: Month/Date | Estimated kWh | Actual kWh
      */
     @PostMapping("/excel")
     public ResponseEntity<ApiResponse<Map<String, Object>>> uploadExcel(
             @RequestParam("file") MultipartFile file,
-            @RequestParam("customerId") Long customerId) {
+            @RequestParam("customerId") Long customerId,
+            @RequestParam(value = "dataType", defaultValue = "SYSTEM") String dataType) {
 
         validateFile(file);
-        Map<String, Object> result = fileUploadService.processUpload(file, customerId, "SYSTEM");
+        Map<String, Object> result = fileUploadService.processUpload(file, customerId, dataType);
         return ResponseEntity.ok(ApiResponse.success("File uploaded and processed", result));
     }
 
