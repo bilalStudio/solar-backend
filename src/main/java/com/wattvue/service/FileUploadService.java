@@ -73,16 +73,23 @@ public class FileUploadService {
 
         try {
             int rowCount;
-            if ("UTILITY".equalsIgnoreCase(dataType)) {
-                List<UtilityData> rows = parseUtilityFile(file, customer, upload);
-                utilityDataRepository.saveAll(rows);
-                rowCount = rows.size();
-            } else {
-                List<SolarData> rows = parseSolarFile(file, customer, upload);
-                solarDataRepository.saveAll(rows);
-                rowCount = rows.size();
-            }
-
+         if ("UTILITY".equalsIgnoreCase(dataType)) {
+    List<UtilityData> rows = parseUtilityFile(file, customer, upload);
+    utilityDataRepository.saveAll(rows);
+    rowCount = rows.size();
+} else if ("SOLAR_ACTUAL".equalsIgnoreCase(dataType) || "SOLAR_ESTIMATED".equalsIgnoreCase(dataType)) {
+    List<SolarData> rows = parseTwoColumnSolarFile(file, customer, upload, dataType);
+    solarDataRepository.saveAll(rows);
+    rowCount = rows.size();
+} else if ("CLEANING_BEFORE".equalsIgnoreCase(dataType) || "CLEANING_AFTER".equalsIgnoreCase(dataType)) {
+    List<SolarData> rows = parseTwoColumnSolarFile(file, customer, upload, dataType);
+    solarDataRepository.saveAll(rows);
+    rowCount = rows.size();
+} else {
+    List<SolarData> rows = parseSolarFile(file, customer, upload);
+    solarDataRepository.saveAll(rows);
+    rowCount = rows.size();
+}
             upload.setStatus("SUCCESS");
             upload.setRowsProcessed(rowCount);
             uploadRepository.save(upload);
@@ -299,4 +306,40 @@ public class FileUploadService {
     private double round2(double v) {
         return Math.round(v * 100.0) / 100.0;
     }
+
+    private List<SolarData> parseTwoColumnSolarFile(MultipartFile file, Customer customer, Upload upload, String dataType) throws Exception {
+    String name = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
+    List<String[]> rows = name.endsWith(".csv") ? readCsvRows(file) : readExcelRows(file);
+    List<SolarData> dataList = new ArrayList<>();
+    boolean isEstimated = "SOLAR_ESTIMATED".equalsIgnoreCase(dataType);
+
+    for (int i = 1; i < rows.size(); i++) {
+        String[] cols = rows.get(i);
+        if (cols.length < 2) continue;
+        try {
+            String dateRaw = cols[0].trim();
+            if (dateRaw.isEmpty() || dateRaw.equalsIgnoreCase("total") || dateRaw.equalsIgnoreCase("summary")) continue;
+            Double value = parseDouble(cols[1]);
+            if (value == null) continue;
+            LocalDate dataDate = tryParseDate(dateRaw);
+            dataList.add(SolarData.builder()
+                    .customer(customer)
+                    .upload(upload)
+                    .month(dateRaw)
+                    .dataDate(dataDate)
+                    .actualKwh(isEstimated ? 0.0 : value)
+                    .estimatedKwh(isEstimated ? value : 0.0)
+                    .varianceKwh(0.0)
+                    .variancePct(0.0)
+                    .build());
+        } catch (Exception e) {
+            log.warn("Skipping row {}: {}", i, e.getMessage());
+        }
+    }
+
+    if (dataList.isEmpty()) {
+        throw new RuntimeException("No valid data rows found. Expected columns: Date | kWh (with header row).");
+    }
+    return dataList;
+}
 }
