@@ -1,0 +1,12 @@
+{
+  "name": "wattvue-mailer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "mail:test": "node mailer/send-mail.js"
+  },
+  "dependencies": {
+    "nodemailer": "^8.0.7"
+  }
+}

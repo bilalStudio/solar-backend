@@ -67,7 +67,7 @@ public class UploadController {
         }
         String lower = name.toLowerCase();
         if (!lower.endsWith(".xlsx") && !lower.endsWith(".xlsm") && !lower.endsWith(".csv")) {
-            throw new RuntimeException("Only .xlsx, .xlsm, and .csv files are supported");
+            throw new RuntimeException("This file type is not supported. Please upload a .xlsx, .xlsm, or .csv file.");
         }
     }
 }

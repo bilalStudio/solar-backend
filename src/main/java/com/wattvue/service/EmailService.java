@@ -11,7 +11,12 @@ import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
@@ -26,11 +31,27 @@ public class EmailService {
     @Value("${app.mail.from-name}")
     private String fromName;
 
+    @Value("${spring.mail.host:smtp.gmail.com}")
+    private String mailHost;
+
+    @Value("${spring.mail.port:587}")
+    private String mailPort;
+
     @Value("${spring.mail.username:}")
     private String mailUsername;
 
+    @Value("${spring.mail.password:}")
+    private String mailPassword;
+
+    @Value("${app.mail.transport:nodemailer}")
+    private String mailTransport;
+
+    @Value("${app.mail.nodemailer.script:mailer/send-mail.js}")
+    private String nodemailerScript;
+
     private boolean isEmailConfigured() {
-        return mailUsername != null && !mailUsername.isEmpty();
+        return mailUsername != null && !mailUsername.isBlank()
+                && mailPassword != null && !mailPassword.isBlank();
     }
 
     /**
@@ -38,7 +59,14 @@ public class EmailService {
      */
     public void sendPasswordResetEmail(String toEmail, String userName, String resetLink) throws Exception {
         if (!isEmailConfigured()) {
-            log.warn("Email not configured (MAIL_USERNAME env var missing). Reset link: {}", resetLink);
+            log.warn("Email not configured (MAIL_USERNAME or MAIL_PASSWORD missing). Reset link: {}", resetLink);
+            return;
+        }
+
+        if (useNodemailer()) {
+            Map<String, Object> payload = basePayload(toEmail, null, "Reset your WattVue password");
+            payload.put("html", buildResetEmailHtml(userName, resetLink));
+            sendWithNodemailer(payload);
             return;
         }
 
@@ -62,6 +90,15 @@ public class EmailService {
             throw new RuntimeException("Email is not configured on the server. Please set MAIL_USERNAME and MAIL_PASSWORD environment variables.");
         }
 
+        if (useNodemailer()) {
+            Map<String, Object> payload = basePayload(toEmail, cc, subject);
+            payload.put("text", body);
+            payload.put("attachmentPath", attachmentPath);
+            payload.put("attachmentName", attachmentName);
+            sendWithNodemailer(payload);
+            return;
+        }
+
         MimeMessage message = mailSender.createMimeMessage();
         MimeMessageHelper helper = new MimeMessageHelper(message, true, StandardCharsets.UTF_8.name());
 
@@ -82,6 +119,77 @@ public class EmailService {
         }
 
         mailSender.send(message);
+    }
+
+    private boolean useNodemailer() {
+        return "nodemailer".equalsIgnoreCase(mailTransport);
+    }
+
+    private Map<String, Object> basePayload(String toEmail, String cc, String subject) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("host", mailHost);
+        payload.put("port", mailPort);
+        payload.put("username", mailUsername);
+        payload.put("password", mailPassword);
+        payload.put("fromEmail", fromEmail);
+        payload.put("fromName", fromName);
+        payload.put("toEmail", toEmail);
+        payload.put("cc", cc);
+        payload.put("subject", subject);
+        return payload;
+    }
+
+    private void sendWithNodemailer(Map<String, Object> payload) throws Exception {
+        File script = new File(nodemailerScript);
+        if (!script.isAbsolute()) {
+            script = new File(System.getProperty("user.dir"), nodemailerScript);
+        }
+        if (!script.exists()) {
+            throw new RuntimeException("Nodemailer script not found: " + script.getAbsolutePath());
+        }
+
+        Process process = new ProcessBuilder("node", script.getAbsolutePath())
+                .redirectErrorStream(false)
+                .start();
+
+        try (OutputStream stdin = process.getOutputStream()) {
+            stdin.write(toJson(payload).getBytes(StandardCharsets.UTF_8));
+        }
+
+        boolean finished = process.waitFor(Duration.ofSeconds(30).toMillis(), TimeUnit.MILLISECONDS);
+        String stdout = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        String stderr = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+
+        if (!finished) {
+            process.destroyForcibly();
+            throw new RuntimeException("Nodemailer timed out while sending email");
+        }
+        if (process.exitValue() != 0) {
+            throw new RuntimeException("Nodemailer failed: " + (stderr.isBlank() ? stdout : stderr).trim());
+        }
+        log.info("Email sent via Nodemailer to {}", payload.get("toEmail"));
+    }
+
+    private String toJson(Map<String, Object> payload) {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, Object> entry : payload.entrySet()) {
+            Object value = entry.getValue();
+            if (value == null || value.toString().isBlank()) continue;
+            if (!first) json.append(",");
+            json.append("\"").append(escapeJson(entry.getKey())).append("\":");
+            json.append("\"").append(escapeJson(value.toString())).append("\"");
+            first = false;
+        }
+        return json.append("}").toString();
+    }
+
+    private String escapeJson(String value) {
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
     }
 
     private String buildResetEmailHtml(String userName, String resetLink) {
