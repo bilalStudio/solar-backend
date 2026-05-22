@@ -5,7 +5,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -15,45 +14,131 @@ import java.util.Base64;
 import java.time.Duration;
 
 /**
- * Email service using Resend.com HTTP API.
- * Works on Railway free tier (no SMTP port needed).
- * Set RESEND_API_KEY environment variable in Railway.
- * Get free API key at https://resend.com
+ * Email service using Brevo (formerly Sendinblue) HTTP API.
+ * Free plan: 300 emails/day, send to ANY email, no domain needed.
+ * Get free API key at https://brevo.com
+ * Set BREVO_API_KEY environment variable in Railway.
  */
 @Service
 @Slf4j
 public class EmailService {
 
+    @Value("${app.brevo.api-key:}")
+    private String brevoApiKey;
+
     @Value("${app.resend.api-key:}")
     private String resendApiKey;
 
-    @Value("${app.mail.from:onboarding@resend.dev}")
+    @Value("${app.mail.from:devmachine69@gmail.com}")
     private String fromEmail;
 
     @Value("${app.mail.from-name:WattVue Solar}")
     private String fromName;
 
-    private boolean isEmailConfigured() {
+    private boolean isBrevoConfigured() {
+        return brevoApiKey != null && !brevoApiKey.isBlank();
+    }
+
+    private boolean isResendConfigured() {
         return resendApiKey != null && !resendApiKey.isBlank();
+    }
+
+    private boolean isEmailConfigured() {
+        return isBrevoConfigured() || isResendConfigured();
     }
 
     public void sendPasswordResetEmail(String toEmail, String userName, String resetLink) throws Exception {
         if (!isEmailConfigured()) {
-            log.warn("Email not configured (RESEND_API_KEY missing). Reset link: {}", resetLink);
+            log.warn("Email not configured. Reset link: {}", resetLink);
             return;
         }
         String html = buildResetEmailHtml(userName, resetLink);
-        sendViaResend(toEmail, null, "Reset your WattVue password", null, html, null, null);
+        if (isBrevoConfigured()) {
+            sendViaBrevo(toEmail, null, "Reset your WattVue password", null, html, null, null);
+        } else {
+            sendViaResend(toEmail, null, "Reset your WattVue password", null, html, null, null);
+        }
     }
 
     public void sendReportEmail(String toEmail, String cc, String subject, String body,
                                 String attachmentPath, String attachmentName) throws Exception {
         if (!isEmailConfigured()) {
-            throw new RuntimeException("Email is not configured. Please set RESEND_API_KEY in Railway environment variables.");
+            throw new RuntimeException("Email is not configured. Please set BREVO_API_KEY in Railway environment variables.");
         }
-        sendViaResend(toEmail, cc, subject, body, null, attachmentPath, attachmentName);
+        if (isBrevoConfigured()) {
+            sendViaBrevo(toEmail, cc, subject, body, null, attachmentPath, attachmentName);
+        } else {
+            sendViaResend(toEmail, cc, subject, body, null, attachmentPath, attachmentName);
+        }
     }
 
+    // ─── Brevo API ────────────────────────────────────────────────────────────
+    private void sendViaBrevo(String toEmail, String cc, String subject,
+                               String textBody, String htmlBody,
+                               String attachmentPath, String attachmentName) throws Exception {
+
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"sender\":{\"name\":\"").append(escapeJson(fromName)).append("\",\"email\":\"").append(escapeJson(fromEmail)).append("\"},");
+        json.append("\"to\":[{\"email\":\"").append(escapeJson(toEmail)).append("\"}],");
+
+        if (cc != null && !cc.isBlank()) {
+            json.append("\"cc\":[");
+            String[] ccList = cc.split(",");
+            for (int i = 0; i < ccList.length; i++) {
+                if (i > 0) json.append(",");
+                json.append("{\"email\":\"").append(escapeJson(ccList[i].trim())).append("\"}");
+            }
+            json.append("],");
+        }
+
+        json.append("\"subject\":\"").append(escapeJson(subject)).append("\",");
+
+        if (htmlBody != null && !htmlBody.isBlank()) {
+            json.append("\"htmlContent\":\"").append(escapeJson(htmlBody)).append("\"");
+        } else {
+            json.append("\"textContent\":\"").append(escapeJson(textBody != null ? textBody : "")).append("\"");
+        }
+
+        if (attachmentPath != null) {
+            File file = new File(attachmentPath);
+            if (file.exists()) {
+                byte[] fileBytes = Files.readAllBytes(file.toPath());
+                String base64Content = Base64.getEncoder().encodeToString(fileBytes);
+                String filename = attachmentName != null ? attachmentName : file.getName();
+                json.append(",\"attachment\":[{");
+                json.append("\"name\":\"").append(escapeJson(filename)).append("\",");
+                json.append("\"content\":\"").append(base64Content).append("\"");
+                json.append("}]");
+            }
+        }
+
+        json.append("}");
+
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.brevo.com/v3/smtp/email"))
+                .header("api-key", brevoApiKey)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
+                .timeout(Duration.ofSeconds(30))
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+            log.info("Email sent via Brevo to {} (status {})", toEmail, response.statusCode());
+        } else {
+            log.error("Brevo API error {}: {}", response.statusCode(), response.body());
+            throw new RuntimeException("Failed to send email. Status: " + response.statusCode() + " — " + response.body());
+        }
+    }
+
+    // ─── Resend API (fallback) ────────────────────────────────────────────────
     private void sendViaResend(String toEmail, String cc, String subject,
                                 String textBody, String htmlBody,
                                 String attachmentPath, String attachmentName) throws Exception {
@@ -81,7 +166,6 @@ public class EmailService {
             json.append("\"text\":\"").append(escapeJson(textBody != null ? textBody : "")).append("\"");
         }
 
-        // Attach PDF if provided
         if (attachmentPath != null) {
             File file = new File(attachmentPath);
             if (file.exists()) {
