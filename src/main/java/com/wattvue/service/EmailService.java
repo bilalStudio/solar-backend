@@ -1,195 +1,132 @@
 package com.wattvue.service;
 
-import jakarta.mail.internet.InternetAddress;
-import jakarta.mail.internet.MimeMessage;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.FileSystemResource;
-import org.springframework.mail.javamail.JavaMailSender;
-import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
-import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.util.Base64;
 import java.time.Duration;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
+/**
+ * Email service using Resend.com HTTP API.
+ * Works on Railway free tier (no SMTP port needed).
+ * Set RESEND_API_KEY environment variable in Railway.
+ * Get free API key at https://resend.com
+ */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class EmailService {
 
-    private final JavaMailSender mailSender;
+    @Value("${app.resend.api-key:}")
+    private String resendApiKey;
 
-    @Value("${app.mail.from}")
+    @Value("${app.mail.from:onboarding@resend.dev}")
     private String fromEmail;
 
-    @Value("${app.mail.from-name}")
+    @Value("${app.mail.from-name:WattVue Solar}")
     private String fromName;
 
-    @Value("${spring.mail.host:smtp.gmail.com}")
-    private String mailHost;
-
-    @Value("${spring.mail.port:587}")
-    private String mailPort;
-
-    @Value("${spring.mail.username:}")
-    private String mailUsername;
-
-    @Value("${spring.mail.password:}")
-    private String mailPassword;
-
-    @Value("${app.mail.transport:nodemailer}")
-    private String mailTransport;
-
-    @Value("${app.mail.nodemailer.script:mailer/send-mail.js}")
-    private String nodemailerScript;
-
     private boolean isEmailConfigured() {
-        return mailUsername != null && !mailUsername.isBlank()
-                && mailPassword != null && !mailPassword.isBlank();
+        return resendApiKey != null && !resendApiKey.isBlank();
     }
 
-    /**
-     * Send password-reset email with a reset link.
-     */
     public void sendPasswordResetEmail(String toEmail, String userName, String resetLink) throws Exception {
         if (!isEmailConfigured()) {
-            log.warn("Email not configured (MAIL_USERNAME or MAIL_PASSWORD missing). Reset link: {}", resetLink);
+            log.warn("Email not configured (RESEND_API_KEY missing). Reset link: {}", resetLink);
             return;
         }
-
-        if (useNodemailer()) {
-            Map<String, Object> payload = basePayload(toEmail, null, "Reset your WattVue password");
-            payload.put("html", buildResetEmailHtml(userName, resetLink));
-            sendWithNodemailer(payload);
-            return;
-        }
-
-        MimeMessage message = mailSender.createMimeMessage();
-        MimeMessageHelper helper = new MimeMessageHelper(message, true, StandardCharsets.UTF_8.name());
-
-        helper.setFrom(new InternetAddress(fromEmail, fromName));
-        helper.setTo(toEmail);
-        helper.setSubject("Reset your WattVue password");
-        helper.setText(buildResetEmailHtml(userName, resetLink), true);
-
-        mailSender.send(message);
+        String html = buildResetEmailHtml(userName, resetLink);
+        sendViaResend(toEmail, null, "Reset your WattVue password", null, html, null, null);
     }
 
-    /**
-     * Send a report email with PDF attachment.
-     */
     public void sendReportEmail(String toEmail, String cc, String subject, String body,
-                                 String attachmentPath, String attachmentName) throws Exception {
+                                String attachmentPath, String attachmentName) throws Exception {
         if (!isEmailConfigured()) {
-            throw new RuntimeException("Email is not configured on the server. Please set MAIL_USERNAME and MAIL_PASSWORD environment variables.");
+            throw new RuntimeException("Email is not configured. Please set RESEND_API_KEY in Railway environment variables.");
+        }
+        sendViaResend(toEmail, cc, subject, body, null, attachmentPath, attachmentName);
+    }
+
+    private void sendViaResend(String toEmail, String cc, String subject,
+                                String textBody, String htmlBody,
+                                String attachmentPath, String attachmentName) throws Exception {
+
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"from\":\"").append(escapeJson(fromName)).append(" <").append(escapeJson(fromEmail)).append(">\",");
+        json.append("\"to\":[\"").append(escapeJson(toEmail)).append("\"],");
+
+        if (cc != null && !cc.isBlank()) {
+            String[] ccList = cc.split(",");
+            json.append("\"cc\":[");
+            for (int i = 0; i < ccList.length; i++) {
+                if (i > 0) json.append(",");
+                json.append("\"").append(escapeJson(ccList[i].trim())).append("\"");
+            }
+            json.append("],");
         }
 
-        if (useNodemailer()) {
-            Map<String, Object> payload = basePayload(toEmail, cc, subject);
-            payload.put("text", body);
-            payload.put("attachmentPath", attachmentPath);
-            payload.put("attachmentName", attachmentName);
-            sendWithNodemailer(payload);
-            return;
+        json.append("\"subject\":\"").append(escapeJson(subject)).append("\",");
+
+        if (htmlBody != null && !htmlBody.isBlank()) {
+            json.append("\"html\":\"").append(escapeJson(htmlBody)).append("\"");
+        } else {
+            json.append("\"text\":\"").append(escapeJson(textBody != null ? textBody : "")).append("\"");
         }
 
-        MimeMessage message = mailSender.createMimeMessage();
-        MimeMessageHelper helper = new MimeMessageHelper(message, true, StandardCharsets.UTF_8.name());
-
-        helper.setFrom(new InternetAddress(fromEmail, fromName));
-        helper.setTo(toEmail);
-        if (cc != null && !cc.isEmpty()) {
-            helper.setCc(cc.split(","));
-        }
-        helper.setSubject(subject);
-        helper.setText(body, false);
-
+        // Attach PDF if provided
         if (attachmentPath != null) {
             File file = new File(attachmentPath);
             if (file.exists()) {
-                helper.addAttachment(attachmentName != null ? attachmentName : file.getName(),
-                        new FileSystemResource(file));
+                byte[] fileBytes = Files.readAllBytes(file.toPath());
+                String base64Content = Base64.getEncoder().encodeToString(fileBytes);
+                String filename = attachmentName != null ? attachmentName : file.getName();
+                json.append(",\"attachments\":[{");
+                json.append("\"filename\":\"").append(escapeJson(filename)).append("\",");
+                json.append("\"content\":\"").append(base64Content).append("\"");
+                json.append("}]");
             }
         }
 
-        mailSender.send(message);
-    }
+        json.append("}");
 
-    private boolean useNodemailer() {
-        return "nodemailer".equalsIgnoreCase(mailTransport);
-    }
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
 
-    private Map<String, Object> basePayload(String toEmail, String cc, String subject) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("host", mailHost);
-        payload.put("port", mailPort);
-        payload.put("username", mailUsername);
-        payload.put("password", mailPassword);
-        payload.put("fromEmail", fromEmail);
-        payload.put("fromName", fromName);
-        payload.put("toEmail", toEmail);
-        payload.put("cc", cc);
-        payload.put("subject", subject);
-        return payload;
-    }
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.resend.com/emails"))
+                .header("Authorization", "Bearer " + resendApiKey)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
+                .timeout(Duration.ofSeconds(30))
+                .build();
 
-    private void sendWithNodemailer(Map<String, Object> payload) throws Exception {
-        File script = new File(nodemailerScript);
-        if (!script.isAbsolute()) {
-            script = new File(System.getProperty("user.dir"), nodemailerScript);
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+            log.info("Email sent via Resend to {} (status {})", toEmail, response.statusCode());
+        } else {
+            log.error("Resend API error {}: {}", response.statusCode(), response.body());
+            throw new RuntimeException("Failed to send email. Status: " + response.statusCode() + " — " + response.body());
         }
-        if (!script.exists()) {
-            throw new RuntimeException("Nodemailer script not found: " + script.getAbsolutePath());
-        }
-
-        Process process = new ProcessBuilder("node", script.getAbsolutePath())
-                .redirectErrorStream(false)
-                .start();
-
-        try (OutputStream stdin = process.getOutputStream()) {
-            stdin.write(toJson(payload).getBytes(StandardCharsets.UTF_8));
-        }
-
-        boolean finished = process.waitFor(Duration.ofSeconds(30).toMillis(), TimeUnit.MILLISECONDS);
-        String stdout = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        String stderr = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-
-        if (!finished) {
-            process.destroyForcibly();
-            throw new RuntimeException("Nodemailer timed out while sending email");
-        }
-        if (process.exitValue() != 0) {
-            throw new RuntimeException("Nodemailer failed: " + (stderr.isBlank() ? stdout : stderr).trim());
-        }
-        log.info("Email sent via Nodemailer to {}", payload.get("toEmail"));
-    }
-
-    private String toJson(Map<String, Object> payload) {
-        StringBuilder json = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, Object> entry : payload.entrySet()) {
-            Object value = entry.getValue();
-            if (value == null || value.toString().isBlank()) continue;
-            if (!first) json.append(",");
-            json.append("\"").append(escapeJson(entry.getKey())).append("\":");
-            json.append("\"").append(escapeJson(value.toString())).append("\"");
-            first = false;
-        }
-        return json.append("}").toString();
     }
 
     private String escapeJson(String value) {
+        if (value == null) return "";
         return value
                 .replace("\\", "\\\\")
                 .replace("\"", "\\\"")
                 .replace("\r", "\\r")
-                .replace("\n", "\\n");
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
     }
 
     private String buildResetEmailHtml(String userName, String resetLink) {
