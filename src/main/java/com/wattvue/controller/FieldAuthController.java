@@ -34,7 +34,8 @@ public class FieldAuthController {
             throw new RuntimeException("Invalid email or password");
         }
 
-        String token = jwtUtil.generateToken(user.getEmail(), "TECHNICIAN");
+        // Use single-argument generateToken to match your existing JwtUtil
+        String token = jwtUtil.generateToken(user.getEmail());
 
         return ResponseEntity.ok(ApiResponse.success("Login successful", Map.of(
                 "token", token,
@@ -61,7 +62,7 @@ public class FieldAuthController {
 
         user = fieldUserRepository.save(user);
 
-        String token = jwtUtil.generateToken(user.getEmail(), "TECHNICIAN");
+        String token = jwtUtil.generateToken(user.getEmail());
 
         return ResponseEntity.ok(ApiResponse.success("Registration successful", Map.of(
                 "token", token,
