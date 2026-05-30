@@ -78,7 +78,7 @@ public class ReportController {
     }
 
     @GetMapping("/download/{reportId}")
-    public ResponseEntity<FileSystemResource> downloadReport(@PathVariable Long reportId) {
+    public ResponseEntity<FileSystemResource> downloadReport(@PathVariable Long reportId) throws Exception {
         File file = reportService.getReportFile(reportId);
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + file.getName() + "\"")
