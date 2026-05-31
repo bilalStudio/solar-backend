@@ -58,7 +58,9 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
                 if (jwtUtil.isTokenValid(token)) {
                     // For field endpoints, check field_users table
-                    if (path.startsWith("/api/field/")) {
+                    boolean isFieldPath = path.startsWith("/api/field/");
+                    boolean isCustomerRead = path.equals("/api/customers") || path.startsWith("/api/customers/");
+                    if (isFieldPath || isCustomerRead) {
                         fieldUserRepository.findByEmail(email).ifPresent(fieldUser -> {
                             if (Boolean.TRUE.equals(fieldUser.getIsActive())) {
                                 UsernamePasswordAuthenticationToken authToken =
